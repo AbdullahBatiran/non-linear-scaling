@@ -32,3 +32,46 @@ To inspect or reuse the conversion table:
 ```python
 scaled, lut = nonlinear_histogram_scale(image, input_levels=2**14, return_lut=True)
 ```
+
+## i3s Frame Viewer
+
+`show_i3s_frames.py` loads i3s raw NumPy recordings from `data/i3s_0_7200`, applies bad-pixel replacement, gain correction, and offset correction, then displays the corrected IR frames.
+
+Install the Python dependencies first:
+
+```bash
+pip install -e .
+```
+
+Show the newest recording:
+
+```bash
+python show_i3s_frames.py --compare-raw
+```
+
+Show a specific recording:
+
+```bash
+python show_i3s_frames.py --recording 20260519_153557_598066_live_recording --compare-raw
+```
+
+Export corrected frames to a lossless 16-bit grayscale MKV video:
+
+```bash
+python show_i3s_frames.py --recording 20260519_153557_598066_live_recording --export-video --export-only
+```
+
+Play a previously exported MKV without applying correction again:
+
+```bash
+python show_i3s_frames.py --video ../data/i3s_0_7200/20260519_153557_598066_live_recording/corrected_frames_16bit.mkv
+```
+
+Useful options:
+
+- `--autoscale`: update display contrast on every frame.
+- `--fps 20`: override playback or export FPS.
+- `--start-frame 100`: start NumPy playback from a selected frame.
+- `--export-video output.mkv`: write the MKV to a chosen path.
+
+Video export and MKV playback require `ffmpeg` and `ffprobe` on `PATH`.

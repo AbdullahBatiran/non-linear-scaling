@@ -21,6 +21,18 @@ DEFAULT_CORRECTION_DIR = REPO_ROOT / "data" / "i3s-bpr-gain-offset-values"
 DEFAULT_VIDEO_NAME = "corrected_frames_16bit.mkv"
 
 
+def parse_rate(rate: Optional[str]) -> Optional[float]:
+    if not rate or rate == "0/0":
+        return None
+    if "/" in rate:
+        numerator, denominator = rate.split("/", 1)
+        denominator_float = float(denominator)
+        if denominator_float == 0:
+            return None
+        return float(numerator) / denominator_float
+    return float(rate)
+
+
 def find_recording(data_dir: Path, recording: Optional[str]) -> Path:
     """Return the raw_frames.npy path for a selected or latest recording."""
 
@@ -216,6 +228,124 @@ def export_corrected_video(
         raise RuntimeError(stderr.decode("utf-8", errors="replace"))
 
 
+def probe_video(video_path: Path) -> Tuple[int, int, Optional[float], Optional[int]]:
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        raise RuntimeError("ffprobe is required to play video files, but it was not found on PATH")
+
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,avg_frame_rate,r_frame_rate,nb_frames",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    result = subprocess.run(command, check=True, capture_output=True, text=True, env=ffmpeg_environment())
+    data = json.loads(result.stdout)
+    streams = data.get("streams", [])
+    if not streams:
+        raise ValueError(f"no video stream found in {video_path}")
+
+    stream = streams[0]
+    fps = parse_rate(stream.get("avg_frame_rate")) or parse_rate(stream.get("r_frame_rate"))
+    frame_count = stream.get("nb_frames")
+    return int(stream["width"]), int(stream["height"]), fps, int(frame_count) if frame_count else None
+
+
+def start_video_decoder(video_path: Path) -> subprocess.Popen:
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to play video files, but it was not found on PATH")
+
+    command = [
+        ffmpeg_path,
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray16le",
+        "-",
+    ]
+    return subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ffmpeg_environment())
+
+
+def read_video_frame(process: subprocess.Popen, *, height: int, width: int) -> Optional[np.ndarray]:
+    assert process.stdout is not None
+    frame_size = height * width * np.dtype("<u2").itemsize
+    frame_bytes = process.stdout.read(frame_size)
+    if len(frame_bytes) == 0:
+        return None
+    if len(frame_bytes) != frame_size:
+        raise RuntimeError(f"incomplete video frame: expected {frame_size} bytes, got {len(frame_bytes)}")
+    return np.frombuffer(frame_bytes, dtype="<u2").reshape(height, width)
+
+
+def display_video(video_path: Path, *, fps: float, autoscale: bool) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation
+
+    width, height, probed_fps, frame_count = probe_video(video_path)
+    playback_fps = fps or probed_fps or 22.0
+    process = start_video_decoder(video_path)
+
+    first_frame = read_video_frame(process, height=height, width=width)
+    if first_frame is None:
+        _, stderr = process.communicate()
+        raise RuntimeError(stderr.decode("utf-8", errors="replace") or f"no frames decoded from {video_path}")
+
+    if autoscale:
+        vmin = vmax = None
+    else:
+        vmin, vmax = np.percentile(first_frame, (1, 99))
+        if vmin == vmax:
+            vmin, vmax = float(np.min(first_frame)), float(np.max(first_frame))
+
+    fig, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    video_image = axis.imshow(first_frame, cmap="gray", vmin=vmin, vmax=vmax)
+    axis.axis("off")
+    frame_label = fig.suptitle("")
+    interval_ms = 1000.0 / max(playback_fps, 0.1)
+    frame_number = 1
+
+    def close_decoder() -> None:
+        if process.poll() is None:
+            process.terminate()
+
+    fig.canvas.mpl_connect("close_event", lambda _event: close_decoder())
+
+    def update(_frame_number: int):
+        nonlocal frame_number
+        next_frame = read_video_frame(process, height=height, width=width)
+        if next_frame is None:
+            animation.event_source.stop()
+            close_decoder()
+            frame_label.set_text(f"{video_path.name} | ended at frame {frame_number}")
+            return video_image, frame_label
+
+        frame_number += 1
+        video_image.set_data(next_frame)
+        if autoscale:
+            low, high = np.percentile(next_frame, (1, 99))
+            video_image.set_clim(low, high)
+        total_frames = frame_count if frame_count is not None else "?"
+        frame_label.set_text(f"{video_path.name} | frame {frame_number}/{total_frames}")
+        return video_image, frame_label
+
+    frame_label.set_text(f"{video_path.name} | frame 1/{frame_count if frame_count is not None else '?'}")
+    animation = FuncAnimation(fig, update, interval=interval_ms, blit=False, cache_frame_data=False)
+    fig._i3s_animation = animation
+    plt.show()
+    close_decoder()
+
+
 def display_frames(
     frames: np.ndarray,
     gain_map: np.ndarray,
@@ -283,6 +413,7 @@ def parse_args() -> argparse.Namespace:
         description="Show i3s IR raw frames with bad-pixel, offset, and gain correction."
     )
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="directory containing recordings")
+    parser.add_argument("--video", type=Path, help="play a 16-bit grayscale MKV video without applying correction")
     parser.add_argument(
         "--recording",
         help="recording folder name, recording folder path, or raw_frames.npy path; defaults to newest recording",
@@ -309,6 +440,11 @@ def main() -> None:
     args = parse_args()
     if args.export_only and not args.export_video:
         raise ValueError("--export-only requires --export-video")
+    if args.video and (args.export_video or args.export_only):
+        raise ValueError("--video cannot be combined with --export-video or --export-only")
+    if args.video:
+        display_video(args.video, fps=args.fps or 0.0, autoscale=args.autoscale)
+        return
 
     raw_frames_path = find_recording(args.data_dir, args.recording)
     metadata = load_metadata(raw_frames_path)
