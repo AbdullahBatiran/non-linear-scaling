@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import warnings
 from pathlib import Path
 from typing import Optional, Tuple
@@ -15,6 +18,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "i3s_0_7200"
 DEFAULT_CORRECTION_DIR = REPO_ROOT / "data" / "i3s-bpr-gain-offset-values"
+DEFAULT_VIDEO_NAME = "corrected_frames_16bit.mkv"
 
 
 def find_recording(data_dir: Path, recording: Optional[str]) -> Path:
@@ -118,10 +122,98 @@ def apply_gain_offset(
     offset_map: np.ndarray,
     bad_pixel_mask: np.ndarray,
 ) -> np.ndarray:
-    """Apply bad-pixel replacement followed by offset and gain correction."""
+    """Apply bad-pixel replacement followed by gain and offset correction."""
 
     replaced = replace_bad_pixels(frame, bad_pixel_mask)
-    return (replaced - offset_map.astype(np.float32, copy=False)) * gain_map.astype(np.float32, copy=False)
+    return replaced * gain_map.astype(np.float32, copy=False) + offset_map.astype(np.float32, copy=False)
+
+
+def corrected_frame_to_uint16(frame: np.ndarray) -> np.ndarray:
+    """Convert corrected floating-point image data to storable 16-bit grayscale."""
+
+    return np.rint(np.clip(frame, 0, np.iinfo(np.uint16).max)).astype("<u2", copy=False)
+
+
+def ffmpeg_environment() -> dict:
+    """Keep Vivado's bundled libraries from shadowing system ffmpeg libraries."""
+
+    env = os.environ.copy()
+    library_path = env.get("LD_LIBRARY_PATH")
+    if library_path:
+        paths = [path for path in library_path.split(os.pathsep) if "Xilinx" not in path]
+        if paths:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(paths)
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def export_corrected_video(
+    frames: np.ndarray,
+    gain_map: np.ndarray,
+    offset_map: np.ndarray,
+    bad_pixel_mask: np.ndarray,
+    *,
+    output_path: Path,
+    fps: float,
+) -> None:
+    """Write corrected frames as lossless 16-bit grayscale FFV1 video."""
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to export 16-bit video, but it was not found on PATH")
+
+    frame_count, height, width = frames.shape
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray16le",
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "-",
+        "-an",
+        "-c:v",
+        "ffv1",
+        "-level",
+        "3",
+        "-g",
+        "1",
+        "-slicecrc",
+        "1",
+        str(output_path),
+    ]
+
+    print(f"Exporting corrected 16-bit video to {output_path}")
+    process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, env=ffmpeg_environment())
+    assert process.stdin is not None
+
+    try:
+        for frame_index, raw_frame in enumerate(frames):
+            corrected_frame = apply_gain_offset(raw_frame, gain_map, offset_map, bad_pixel_mask)
+            video_frame = corrected_frame_to_uint16(corrected_frame)
+            process.stdin.write(video_frame.tobytes(order="C"))
+            if (frame_index + 1) % 50 == 0 or frame_index + 1 == frame_count:
+                print(f"  wrote {frame_index + 1}/{frame_count} frames")
+    except BrokenPipeError as error:
+        _, stderr = process.communicate()
+        raise RuntimeError(stderr.decode("utf-8", errors="replace")) from error
+    finally:
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError(stderr.decode("utf-8", errors="replace"))
 
 
 def display_frames(
@@ -200,11 +292,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--autoscale", action="store_true", help="rescale contrast on every frame")
     parser.add_argument("--compare-raw", action="store_true", help="show raw and corrected frames side by side")
+    parser.add_argument(
+        "--export-video",
+        nargs="?",
+        const=DEFAULT_VIDEO_NAME,
+        help=(
+            "export corrected frames to a lossless 16-bit grayscale MKV. "
+            f"With no path, writes {DEFAULT_VIDEO_NAME} beside raw_frames.npy"
+        ),
+    )
+    parser.add_argument("--export-only", action="store_true", help="export video without opening the viewer")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.export_only and not args.export_video:
+        raise ValueError("--export-only requires --export-video")
+
     raw_frames_path = find_recording(args.data_dir, args.recording)
     metadata = load_metadata(raw_frames_path)
 
@@ -220,17 +325,31 @@ def main() -> None:
     print(f"Using correction maps from {args.correction_dir}")
     print(f"Bad pixels in mask: {int(np.count_nonzero(bad_pixel_mask))}")
 
-    display_frames(
-        frames,
-        gain_map,
-        offset_map,
-        bad_pixel_mask,
-        fps=fps,
-        start_frame=args.start_frame,
-        autoscale=args.autoscale,
-        compare_raw=args.compare_raw,
-        title=title,
-    )
+    if args.export_video:
+        output_path = Path(args.export_video)
+        if not output_path.is_absolute() and output_path.name == str(output_path):
+            output_path = raw_frames_path.with_name(output_path.name)
+        export_corrected_video(
+            frames,
+            gain_map,
+            offset_map,
+            bad_pixel_mask,
+            output_path=output_path,
+            fps=fps,
+        )
+
+    if not args.export_only:
+        display_frames(
+            frames,
+            gain_map,
+            offset_map,
+            bad_pixel_mask,
+            fps=fps,
+            start_frame=args.start_frame,
+            autoscale=args.autoscale,
+            compare_raw=args.compare_raw,
+            title=title,
+        )
 
 
 if __name__ == "__main__":
