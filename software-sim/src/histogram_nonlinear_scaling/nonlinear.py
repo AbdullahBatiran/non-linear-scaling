@@ -105,9 +105,6 @@ def _quantize_image(
         normalized = (image.astype(np.float64, copy=False) - input_min) / (input_max - input_min)
         quantized = np.rint(np.clip(normalized, 0.0, 1.0) * (levels - 1)).astype(np.int64)
 
-    print(f"levels: {levels}")
-    print(f"quantized image: {quantized}")
-
     return quantized, levels
 
 
