@@ -30,6 +30,17 @@ from show_i3s_frames import (
 
 DEFAULT_VIDEO_DIR = REPO_ROOT / "data" / "corrected-videos"
 DEFAULT_OUTPUT_DIR = DEFAULT_VIDEO_DIR / "enhanced"
+DEFAULT_LINEAR_PERCENTILES = (1.0, 99.0)
+
+
+def output_format(output_bits: int) -> tuple[int, np.dtype]:
+    """Return the maximum value and dtype for a supported output bit depth."""
+
+    if output_bits == 8:
+        return 255, np.dtype(np.uint8)
+    if output_bits == 16:
+        return 16383, np.dtype(np.uint16)
+    raise ValueError("output_bits must be 8 or 16")
 
 
 def find_video(video_dir: Path, recording: Optional[str]) -> Path:
@@ -63,25 +74,68 @@ def enhance_frame_nonlinear(
 ) -> np.ndarray:
     """Enhance one corrected 16-bit frame with the histogram non-linear scaler."""
 
-    if output_bits == 8:
-        return nonlinear_histogram_scale(
+    output_max, output_dtype = output_format(output_bits)
+    return nonlinear_histogram_scale(
+        frame,
+        input_levels=input_max + 1,
+        input_min=0,
+        input_max=input_max,
+        output_max=output_max,
+        output_dtype=output_dtype,
+    )
+
+
+def enhance_frame_linear(
+    frame: np.ndarray,
+    *,
+    output_bits: int,
+    input_max: int,
+    lower_percentile: float = DEFAULT_LINEAR_PERCENTILES[0],
+    upper_percentile: float = DEFAULT_LINEAR_PERCENTILES[1],
+) -> np.ndarray:
+    """Enhance one corrected frame with a percentile-clipped linear stretch."""
+
+    output_max, output_dtype = output_format(output_bits)
+    clipped = np.clip(frame, 0, input_max).astype(np.float64, copy=False)
+    frame_min, frame_max = np.percentile(clipped, (lower_percentile, upper_percentile))
+    frame_min = float(frame_min)
+    frame_max = float(frame_max)
+    if frame_max <= frame_min:
+        return np.zeros(frame.shape, dtype=output_dtype)
+
+    scaled = (clipped - frame_min) * (output_max / (frame_max - frame_min))
+    return np.rint(np.clip(scaled, 0, output_max)).astype(output_dtype)
+
+
+def preview_images_for_frame(
+    frame: np.ndarray,
+    *,
+    output_bits: int,
+    input_max: int,
+    compare_original: bool,
+    compare_linear: Optional[tuple[float, float]],
+) -> list[tuple[str, np.ndarray, Optional[int], Optional[int]]]:
+    """Build the titled image list for previewing one decoded frame."""
+
+    images: list[tuple[str, np.ndarray, Optional[int], Optional[int]]] = []
+    if compare_original:
+        images.append(("Corrected", frame, None, None))
+    if compare_linear is not None:
+        lower_percentile, upper_percentile = compare_linear
+        linear = enhance_frame_linear(
             frame,
-            input_levels=input_max + 1,
-            input_min=0,
+            output_bits=output_bits,
             input_max=input_max,
-            output_max=255,
-            output_dtype=np.uint8,
+            lower_percentile=lower_percentile,
+            upper_percentile=upper_percentile,
         )
-    if output_bits == 16:
-        return nonlinear_histogram_scale(
-            frame,
-            input_levels=input_max + 1,
-            input_min=0,
-            input_max=input_max,
-            output_max=65535,
-            output_dtype=np.uint16,
-        )
-    raise ValueError("output_bits must be 8 or 16")
+        title = f"Linear Stretch ({lower_percentile:g}-{upper_percentile:g}%)"
+        images.append((title, linear, 0, (2**output_bits) - 1))
+
+
+    enhanced = enhance_frame_nonlinear(frame, output_bits=output_bits, input_max=input_max)
+    images.append(("Non-linear Enhanced", enhanced, 0, (2**output_bits) - 1))
+    return images
 
 
 def start_video_encoder(output_path: Path, *, width: int, height: int, fps: float, output_bits: int):
@@ -174,6 +228,7 @@ def display_enhanced_video(
     fps_override: Optional[float],
     input_max: int,
     compare_original: bool,
+    compare_linear: Optional[tuple[float, float]],
 ) -> None:
     """Preview an enhanced corrected MKV without writing a new file."""
 
@@ -187,19 +242,26 @@ def display_enhanced_video(
     if first_frame is None:
         raise RuntimeError(f"no frames decoded from {video_path}")
 
-    first_enhanced = enhance_frame_nonlinear(first_frame, output_bits=output_bits, input_max=input_max)
-    if compare_original:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-        original_image = axes[0].imshow(first_frame, cmap="gray")
-        enhanced_image = axes[1].imshow(first_enhanced, cmap="gray", vmin=0, vmax=(2**output_bits) - 1)
-        axes[0].set_title("Corrected")
-        axes[1].set_title("Enhanced")
-        for axis in axes:
+    first_images = preview_images_for_frame(
+        first_frame,
+        output_bits=output_bits,
+        input_max=input_max,
+        compare_original=compare_original,
+        compare_linear=compare_linear,
+    )
+    if len(first_images) > 1:
+        fig_width = 6 * len(first_images)
+        fig, axes = plt.subplots(1, len(first_images), figsize=(fig_width, 5), constrained_layout=True)
+        rendered_images = []
+        for axis, (title, image, vmin, vmax) in zip(np.atleast_1d(axes), first_images):
+            rendered_images.append(axis.imshow(image, cmap="gray", vmin=vmin, vmax=vmax))
+            axis.set_title(title)
             axis.axis("off")
     else:
         fig, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
-        original_image = None
-        enhanced_image = axis.imshow(first_enhanced, cmap="gray", vmin=0, vmax=(2**output_bits) - 1)
+        title, image, vmin, vmax = first_images[0]
+        rendered_images = [axis.imshow(image, cmap="gray", vmin=vmin, vmax=vmax)]
+        axis.set_title(title)
         axis.axis("off")
 
     frame_label = fig.suptitle("")
@@ -219,16 +281,21 @@ def display_enhanced_video(
             animation.event_source.stop()
             close_decoder()
             frame_label.set_text(f"{video_path.name} | ended at frame {frame_number}")
-            return tuple(image for image in (original_image, enhanced_image, frame_label) if image is not None)
+            return (*rendered_images, frame_label)
 
-        enhanced = enhance_frame_nonlinear(frame, output_bits=output_bits, input_max=input_max)
-        if original_image is not None:
-            original_image.set_data(frame)
-        enhanced_image.set_data(enhanced)
+        frame_images = preview_images_for_frame(
+            frame,
+            output_bits=output_bits,
+            input_max=input_max,
+            compare_original=compare_original,
+            compare_linear=compare_linear,
+        )
+        for rendered_image, (_title, image, _vmin, _vmax) in zip(rendered_images, frame_images):
+            rendered_image.set_data(image)
         frame_number += 1
         total = frame_count if frame_count is not None else "?"
         frame_label.set_text(f"{video_path.name} | frame {frame_number}/{total}")
-        return tuple(image for image in (original_image, enhanced_image, frame_label) if image is not None)
+        return (*rendered_images, frame_label)
 
     total = frame_count if frame_count is not None else "?"
     frame_label.set_text(f"{video_path.name} | frame 1/{total}")
@@ -242,7 +309,33 @@ def default_output_path(video_path: Path, output_dir: Path, output_bits: int) ->
     return output_dir / f"{video_path.stem}_nonlinear_{output_bits}bit.mkv"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_linear_percentiles(value: str) -> tuple[float, float]:
+    parts = value.split(",")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected LOW,HIGH percentiles, for example 1,99")
+
+    try:
+        lower_percentile = float(parts[0])
+        upper_percentile = float(parts[1])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("linear percentiles must be numeric") from error
+
+    if not 0.0 <= lower_percentile < upper_percentile <= 100.0:
+        raise argparse.ArgumentTypeError("linear percentiles must satisfy 0 <= LOW < HIGH <= 100")
+    return lower_percentile, upper_percentile
+
+
+def normalize_compare_linear_args(argv: list[str]) -> list[str]:
+    normalized = []
+    for arg in argv:
+        if arg.startswith("--compare-linear,"):
+            normalized.append(f"--compare-linear={arg.split(',', 1)[1]}")
+        else:
+            normalized.append(arg)
+    return normalized
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Apply enhancement algorithms to corrected i3s MKV recordings."
     )
@@ -254,11 +347,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, help="output MKV path for export mode")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-bits", type=int, choices=(8, 16), default=8)
-    parser.add_argument("--input-max", type=int, default=65535, help="input range maximum for the scaler")
+    parser.add_argument("--input-max", type=int, default=2**14-1, help="input range maximum for the scaler")
     parser.add_argument("--fps", type=float, help="override detected FPS")
     parser.add_argument("--export", action="store_true", help="write enhanced MKV instead of previewing")
     parser.add_argument("--compare-original", action="store_true", help="show corrected and enhanced frames side by side")
-    return parser.parse_args()
+    parser.add_argument(
+        "--compare-linear",
+        nargs="?",
+        const="1,99",
+        default=None,
+        metavar="LOW,HIGH",
+        type=parse_linear_percentiles,
+        help="show percentile-clipped linear stretch beside non-linear enhanced frames; defaults to 1,99",
+    )
+    return parser.parse_args(normalize_compare_linear_args(argv if argv is not None else sys.argv[1:]))
 
 
 def main() -> None:
@@ -282,6 +384,7 @@ def main() -> None:
         fps_override=args.fps,
         input_max=args.input_max,
         compare_original=args.compare_original,
+        compare_linear=args.compare_linear,
     )
 
 
