@@ -31,6 +31,7 @@ from show_i3s_frames import (
 DEFAULT_VIDEO_DIR = REPO_ROOT / "data" / "corrected-videos"
 DEFAULT_OUTPUT_DIR = DEFAULT_VIDEO_DIR / "enhanced"
 DEFAULT_LINEAR_PERCENTILES = (1.0, 99.0)
+DEFAULT_HISTOGRAM_OPTIONS = (256, "linear")
 
 
 def output_format(output_bits: int) -> tuple[int, np.dtype]:
@@ -132,10 +133,78 @@ def preview_images_for_frame(
         title = f"Linear Stretch ({lower_percentile:g}-{upper_percentile:g}%)"
         images.append((title, linear, 0, (2**output_bits) - 1))
 
-
     enhanced = enhance_frame_nonlinear(frame, output_bits=output_bits, input_max=input_max)
     images.append(("Non-linear Enhanced", enhanced, 0, (2**output_bits) - 1))
     return images
+
+
+def histogram_range(
+    *,
+    vmin: Optional[int],
+    vmax: Optional[int],
+    input_max: int,
+) -> tuple[float, float]:
+    if vmin is None or vmax is None:
+        return 0.0, float(input_max)
+    return float(vmin), float(vmax)
+
+
+def histogram_counts(
+    image: np.ndarray,
+    *,
+    bins: int,
+    value_range: tuple[float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    counts, edges = np.histogram(image, bins=bins, range=value_range)
+    centers = (edges[:-1] + edges[1:]) * 0.5
+    return centers, counts
+
+
+def create_histogram_preview(
+    images: list[tuple[str, np.ndarray, Optional[int], Optional[int]]],
+    *,
+    bins: int,
+    yscale: str,
+    input_max: int,
+):
+    import matplotlib.pyplot as plt
+
+    fig_width = 6 * len(images)
+    fig, axes = plt.subplots(1, len(images), figsize=(fig_width, 4), constrained_layout=True)
+    rendered_histograms = []
+
+    for axis, (title, image, vmin, vmax) in zip(np.atleast_1d(axes), images):
+        value_range = histogram_range(vmin=vmin, vmax=vmax, input_max=input_max)
+        centers, counts = histogram_counts(image, bins=bins, value_range=value_range)
+        (line,) = axis.plot(centers, counts, drawstyle="steps-mid")
+        axis.set_title(title)
+        axis.set_xlim(value_range)
+        axis.set_ylim(histogram_ylim(counts, yscale))
+        axis.set_yscale(yscale)
+        rendered_histograms.append((line, axis, value_range))
+
+    fig.suptitle(f"Histograms | {bins} bins | {yscale}")
+    return fig, rendered_histograms
+
+
+def histogram_ylim(counts: np.ndarray, yscale: str) -> tuple[float, float]:
+    max_count = max(int(np.max(counts)) if counts.size else 0, 1)
+    if yscale == "log":
+        return 0.8, max_count * 1.25
+    return 0.0, max_count * 1.1
+
+
+def update_histogram_preview(
+    rendered_histograms,
+    images: list[tuple[str, np.ndarray, Optional[int], Optional[int]]],
+    *,
+    bins: int,
+    yscale: str,
+) -> None:
+    for (line, axis, value_range), (_title, image, _vmin, _vmax) in zip(rendered_histograms, images):
+        centers, counts = histogram_counts(image, bins=bins, value_range=value_range)
+        line.set_data(centers, counts)
+        axis.set_ylim(histogram_ylim(counts, yscale))
 
 
 def start_video_encoder(output_path: Path, *, width: int, height: int, fps: float, output_bits: int):
@@ -229,6 +298,7 @@ def display_enhanced_video(
     input_max: int,
     compare_original: bool,
     compare_linear: Optional[tuple[float, float]],
+    show_hist: Optional[tuple[int, str]],
 ) -> None:
     """Preview an enhanced corrected MKV without writing a new file."""
 
@@ -249,6 +319,20 @@ def display_enhanced_video(
         compare_original=compare_original,
         compare_linear=compare_linear,
     )
+    hist_fig = None
+    rendered_histograms = None
+    if show_hist is not None:
+        hist_bins, hist_yscale = show_hist
+        hist_fig, rendered_histograms = create_histogram_preview(
+            first_images,
+            bins=hist_bins,
+            yscale=hist_yscale,
+            input_max=input_max,
+        )
+    else:
+        hist_bins = DEFAULT_HISTOGRAM_OPTIONS[0]
+        hist_yscale = DEFAULT_HISTOGRAM_OPTIONS[1]
+
     if len(first_images) > 1:
         fig_width = 6 * len(first_images)
         fig, axes = plt.subplots(1, len(first_images), figsize=(fig_width, 5), constrained_layout=True)
@@ -272,7 +356,18 @@ def display_enhanced_video(
         if decoder.poll() is None:
             decoder.terminate()
 
-    fig.canvas.mpl_connect("close_event", lambda _event: close_decoder())
+    def close_histogram_preview() -> None:
+        nonlocal rendered_histograms
+        rendered_histograms = None
+
+    def close_preview() -> None:
+        close_decoder()
+        if hist_fig is not None:
+            plt.close(hist_fig)
+
+    fig.canvas.mpl_connect("close_event", lambda _event: close_preview())
+    if hist_fig is not None:
+        hist_fig.canvas.mpl_connect("close_event", lambda _event: close_histogram_preview())
 
     def update(_frame_number: int):
         nonlocal frame_number
@@ -292,6 +387,15 @@ def display_enhanced_video(
         )
         for rendered_image, (_title, image, _vmin, _vmax) in zip(rendered_images, frame_images):
             rendered_image.set_data(image)
+        if rendered_histograms is not None:
+            update_histogram_preview(
+                rendered_histograms,
+                frame_images,
+                bins=hist_bins,
+                yscale=hist_yscale,
+            )
+            if hist_fig is not None:
+                hist_fig.canvas.draw_idle()
         frame_number += 1
         total = frame_count if frame_count is not None else "?"
         frame_label.set_text(f"{video_path.name} | frame {frame_number}/{total}")
@@ -325,11 +429,41 @@ def parse_linear_percentiles(value: str) -> tuple[float, float]:
     return lower_percentile, upper_percentile
 
 
-def normalize_compare_linear_args(argv: list[str]) -> list[str]:
+def parse_histogram_options(value: str) -> tuple[int, str]:
+    if not value:
+        return DEFAULT_HISTOGRAM_OPTIONS
+
+    parts = value.split(",")
+    if len(parts) > 2:
+        raise argparse.ArgumentTypeError("expected BINS or BINS,linear|log")
+
+    if len(parts) == 1 and parts[0].strip().lower() in {"linear", "log"}:
+        return DEFAULT_HISTOGRAM_OPTIONS[0], parts[0].strip().lower()
+
+    try:
+        bins = int(parts[0])
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("histogram bins must be an integer") from error
+
+    if bins < 2:
+        raise argparse.ArgumentTypeError("histogram bins must be at least 2")
+
+    yscale = DEFAULT_HISTOGRAM_OPTIONS[1]
+    if len(parts) == 2:
+        yscale = parts[1].strip().lower()
+        if yscale not in {"linear", "log"}:
+            raise argparse.ArgumentTypeError("histogram y-scale must be linear or log")
+
+    return bins, yscale
+
+
+def normalize_comma_option_args(argv: list[str]) -> list[str]:
     normalized = []
     for arg in argv:
         if arg.startswith("--compare-linear,"):
             normalized.append(f"--compare-linear={arg.split(',', 1)[1]}")
+        elif arg.startswith("--show-hist,"):
+            normalized.append(f"--show-hist={arg.split(',', 1)[1]}")
         else:
             normalized.append(arg)
     return normalized
@@ -360,7 +494,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=parse_linear_percentiles,
         help="show percentile-clipped linear stretch beside non-linear enhanced frames; defaults to 1,99",
     )
-    return parser.parse_args(normalize_compare_linear_args(argv if argv is not None else sys.argv[1:]))
+    parser.add_argument(
+        "--show-hist",
+        nargs="?",
+        const=f"{DEFAULT_HISTOGRAM_OPTIONS[0]},{DEFAULT_HISTOGRAM_OPTIONS[1]}",
+        default=None,
+        metavar="BINS[,linear|log]",
+        type=parse_histogram_options,
+        help="show per-frame histograms in a second window; defaults to 256,linear",
+    )
+    return parser.parse_args(normalize_comma_option_args(argv if argv is not None else sys.argv[1:]))
 
 
 def main() -> None:
@@ -385,6 +528,7 @@ def main() -> None:
         input_max=args.input_max,
         compare_original=args.compare_original,
         compare_linear=args.compare_linear,
+        show_hist=args.show_hist,
     )
 
 
