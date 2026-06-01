@@ -64,8 +64,8 @@ def histogram_levels(histogram_bits: int) -> int:
 
 
 def histogram_addresses(frame: np.ndarray, *, input_bits: int, histogram_bits: int) -> np.ndarray:
-    max_input = intensity_levels(input_bits) - 1
-    quantized = np.clip(frame, 0, max_input).astype(np.uint16, copy=False)
+    input_mask = intensity_levels(input_bits) - 1
+    quantized = (frame.astype(np.uint16, copy=False) & input_mask).astype(np.uint16, copy=False)
     shift = input_bits - histogram_bits
     if shift == 0:
         return quantized
@@ -156,8 +156,12 @@ def apply_lut(frame: np.ndarray, lut: np.ndarray, *, input_bits: int, histogram_
     return lut[addresses].astype(np.uint16, copy=False)
 
 
-def bypass_frame(frame: np.ndarray, *, output_bits: int) -> np.ndarray:
-    return (frame.astype(np.uint16, copy=False) & output_max(output_bits)).astype(np.uint16, copy=False)
+def bypass_frame(frame: np.ndarray, *, input_bits: int, output_bits: int) -> np.ndarray:
+    input_mask = intensity_levels(input_bits) - 1
+    quantized = (frame.astype(np.uint16, copy=False) & input_mask).astype(np.uint16, copy=False)
+    if output_bits >= input_bits:
+        return quantized.astype(np.uint16, copy=False)
+    return np.right_shift(quantized, input_bits - output_bits).astype(np.uint16, copy=False)
 
 
 def process_frames_previous_lut(
@@ -182,7 +186,7 @@ def process_frames_previous_lut(
 
     for frame_index, frame in enumerate(frames):
         if current_lut is None:
-            output = bypass_frame(frame, output_bits=output_bits)
+            output = bypass_frame(frame, input_bits=input_bits, output_bits=output_bits)
             source_lut_frame = None
             output_bypassed = True
         else:

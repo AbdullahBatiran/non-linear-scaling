@@ -1,12 +1,127 @@
 `timescale 1ns / 1ps
 
+/* verilator lint_off DECLFILENAME */
+
 module hist_nonlinear_axi #(
-    parameter INPUT_BITS = 10,
+    parameter INPUT_BITS = 14,
     parameter OUTPUT_BITS = 10,
     parameter AXIS_BITS = 16,
     parameter FRAME_WIDTH = 640,
     parameter FRAME_HEIGHT = 512,
     parameter INTENSITY_LEVELS = 1024,
+    parameter LOG_TABLE_ENTRIES = 1024,
+    parameter COUNT_BITS = 32,
+    parameter ADDR_BITS = 10,
+    parameter MEM_USE_BRAM = 1
+) (
+    input wire aclk,
+    input wire aresetn,
+
+    input wire [AXIS_BITS-1:0] s_axis_tdata,
+    input wire s_axis_tvalid,
+    output wire s_axis_tready,
+    input wire s_axis_tuser,
+    input wire s_axis_tlast,
+
+    output wire [AXIS_BITS-1:0] m_axis_tdata,
+    output wire m_axis_tvalid,
+    input wire m_axis_tready,
+    output wire m_axis_tuser,
+    output wire m_axis_tlast,
+
+    output wire busy_building_lut,
+    output wire lut_valid
+);
+
+    wire hist_we;
+    wire [ADDR_BITS-1:0] hist_waddr;
+    wire [COUNT_BITS-1:0] hist_wdata;
+    wire [ADDR_BITS-1:0] hist_raddr;
+    wire [COUNT_BITS-1:0] hist_rdata;
+
+    wire lut_we;
+    wire [ADDR_BITS-1:0] lut_waddr;
+    wire [OUTPUT_BITS-1:0] lut_wdata;
+    wire [ADDR_BITS-1:0] lut_raddr;
+    wire [OUTPUT_BITS-1:0] lut_rdata;
+
+    hist_nonlinear_axi_core #(
+        .INPUT_BITS(INPUT_BITS),
+        .OUTPUT_BITS(OUTPUT_BITS),
+        .AXIS_BITS(AXIS_BITS),
+        .FRAME_WIDTH(FRAME_WIDTH),
+        .FRAME_HEIGHT(FRAME_HEIGHT),
+        .LOG_TABLE_ENTRIES(LOG_TABLE_ENTRIES),
+        .COUNT_BITS(COUNT_BITS),
+        .ADDR_BITS(ADDR_BITS)
+    ) core (
+        .aclk(aclk),
+        .aresetn(aresetn),
+
+        .s_axis_tdata(s_axis_tdata),
+        .s_axis_tvalid(s_axis_tvalid),
+        .s_axis_tready(s_axis_tready),
+        .s_axis_tuser(s_axis_tuser),
+        .s_axis_tlast(s_axis_tlast),
+
+        .m_axis_tdata(m_axis_tdata),
+        .m_axis_tvalid(m_axis_tvalid),
+        .m_axis_tready(m_axis_tready),
+        .m_axis_tuser(m_axis_tuser),
+        .m_axis_tlast(m_axis_tlast),
+
+        .busy_building_lut(busy_building_lut),
+        .lut_valid(lut_valid),
+
+        .hist_we(hist_we),
+        .hist_waddr(hist_waddr),
+        .hist_wdata(hist_wdata),
+        .hist_raddr(hist_raddr),
+        .hist_rdata(hist_rdata),
+
+        .lut_we(lut_we),
+        .lut_waddr(lut_waddr),
+        .lut_wdata(lut_wdata),
+        .lut_raddr(lut_raddr),
+        .lut_rdata(lut_rdata)
+    );
+
+    hist_nonlinear_ram_1r1w #(
+        .DATA_BITS(COUNT_BITS),
+        .ADDR_BITS(ADDR_BITS),
+        .DEPTH(INTENSITY_LEVELS),
+        .USE_BRAM(MEM_USE_BRAM)
+    ) histogram_memory (
+        .clk(aclk),
+        .rd_addr(hist_raddr),
+        .rd_data(hist_rdata),
+        .we(hist_we),
+        .wr_addr(hist_waddr),
+        .wr_data(hist_wdata)
+    );
+
+    hist_nonlinear_ram_1r1w #(
+        .DATA_BITS(OUTPUT_BITS),
+        .ADDR_BITS(ADDR_BITS),
+        .DEPTH(INTENSITY_LEVELS),
+        .USE_BRAM(MEM_USE_BRAM)
+    ) lut_memory (
+        .clk(aclk),
+        .rd_addr(lut_raddr),
+        .rd_data(lut_rdata),
+        .we(lut_we),
+        .wr_addr(lut_waddr),
+        .wr_data(lut_wdata)
+    );
+
+endmodule
+
+module hist_nonlinear_axi_core #(
+    parameter INPUT_BITS = 14,
+    parameter OUTPUT_BITS = 10,
+    parameter AXIS_BITS = 16,
+    parameter FRAME_WIDTH = 640,
+    parameter FRAME_HEIGHT = 512,
     parameter LOG_TABLE_ENTRIES = 1024,
     parameter COUNT_BITS = 32,
     parameter ADDR_BITS = 10
@@ -27,7 +142,19 @@ module hist_nonlinear_axi #(
     output reg m_axis_tlast,
 
     output reg busy_building_lut,
-    output reg lut_valid
+    output reg lut_valid,
+
+    output reg hist_we,
+    output reg [ADDR_BITS-1:0] hist_waddr,
+    output reg [COUNT_BITS-1:0] hist_wdata,
+    output reg [ADDR_BITS-1:0] hist_raddr,
+    input wire [COUNT_BITS-1:0] hist_rdata,
+
+    output reg lut_we,
+    output reg [ADDR_BITS-1:0] lut_waddr,
+    output reg [OUTPUT_BITS-1:0] lut_wdata,
+    output reg [ADDR_BITS-1:0] lut_raddr,
+    input wire [OUTPUT_BITS-1:0] lut_rdata
 );
 
     localparam STATE_CLEAR = 2'd0;
@@ -53,21 +180,6 @@ module hist_nonlinear_axi #(
     reg [COUNT_BITS-1:0] modified_value;
     reg [COUNT_BITS-1:0] next_cumulative;
 
-    (* ram_style = "block" *) reg [COUNT_BITS-1:0] histogram [0:INTENSITY_LEVELS-1];
-    (* ram_style = "block" *) reg [OUTPUT_BITS-1:0] lut [0:INTENSITY_LEVELS-1];
-
-    reg hist_we;
-    reg [ADDR_BITS-1:0] hist_waddr;
-    reg [COUNT_BITS-1:0] hist_wdata;
-    reg [ADDR_BITS-1:0] hist_raddr;
-    reg [COUNT_BITS-1:0] hist_rdata;
-
-    reg lut_we;
-    reg [ADDR_BITS-1:0] lut_waddr;
-    reg [OUTPUT_BITS-1:0] lut_wdata;
-    reg [ADDR_BITS-1:0] lut_raddr;
-    reg [OUTPUT_BITS-1:0] lut_rdata;
-
     reg [ADDR_BITS-1:0] stream_level;
     reg [OUTPUT_BITS-1:0] stream_bypass_pixel;
     reg stream_tuser;
@@ -85,23 +197,19 @@ module hist_nonlinear_axi #(
     assign output_slot_available = (!m_axis_tvalid) || m_axis_tready;
     assign s_axis_tready = (state == STATE_STREAM) && (stream_stage == 2'd0) && output_slot_available;
     assign input_transfer = s_axis_tvalid && s_axis_tready;
-    assign input_level = s_axis_tdata[INPUT_BITS-1:0];
+    assign input_level = s_axis_tdata[INPUT_BITS-1 -: ADDR_BITS];
     assign output_pixel = lut_valid ? lut_rdata : stream_bypass_pixel;
     assign unused_input_bits = s_axis_tdata[AXIS_BITS-1:INPUT_BITS];
 
-    always @(posedge aclk) begin
-        hist_rdata <= histogram[hist_raddr];
-        if (hist_we) begin
-            histogram[hist_waddr] <= hist_wdata;
-        end
-    end
+    generate
+        if (INPUT_BITS > ADDR_BITS) begin : gen_unused_input_lsb_bits
+            /* verilator lint_off UNUSEDSIGNAL */
+            wire [INPUT_BITS-ADDR_BITS-1:0] unused_input_lsb_bits;
+            /* verilator lint_on UNUSEDSIGNAL */
 
-    always @(posedge aclk) begin
-        lut_rdata <= lut[lut_raddr];
-        if (lut_we) begin
-            lut[lut_waddr] <= lut_wdata;
+            assign unused_input_lsb_bits = s_axis_tdata[INPUT_BITS-ADDR_BITS-1:0];
         end
-    end
+    endgenerate
 
     function [COUNT_BITS-1:0] floor_log2;
         input [COUNT_BITS-1:0] value;
@@ -243,7 +351,7 @@ module hist_nonlinear_axi #(
                                 hist_raddr <= input_level;
                                 lut_raddr <= input_level;
                                 stream_level <= input_level;
-                                stream_bypass_pixel <= s_axis_tdata[OUTPUT_BITS-1:0];
+                                stream_bypass_pixel <= s_axis_tdata[INPUT_BITS-1 -: OUTPUT_BITS];
                                 stream_tuser <= s_axis_tuser;
                                 stream_tlast <= s_axis_tlast;
                                 stream_last_pixel <= (pixel_count == LAST_FRAME_PIXEL);
@@ -360,3 +468,58 @@ module hist_nonlinear_axi #(
     /* verilator lint_on BLKSEQ */
 
 endmodule
+
+module hist_nonlinear_ram_1r1w #(
+    parameter DATA_BITS = 32,
+    parameter ADDR_BITS = 10,
+    parameter DEPTH = 1024,
+    /* verilator lint_off UNUSEDPARAM */
+    parameter USE_BRAM = 1
+    /* verilator lint_on UNUSEDPARAM */
+) (
+    input wire clk,
+    input wire [ADDR_BITS-1:0] rd_addr,
+    output reg [DATA_BITS-1:0] rd_data,
+    input wire we,
+    input wire [ADDR_BITS-1:0] wr_addr,
+    input wire [DATA_BITS-1:0] wr_data
+);
+
+    generate
+`ifdef VERILATOR
+        begin : gen_verilator_ram
+            reg [DATA_BITS-1:0] mem [0:DEPTH-1];
+
+            always @(posedge clk) begin
+                rd_data <= mem[rd_addr];
+                if (we) begin
+                    mem[wr_addr] <= wr_data;
+                end
+            end
+        end
+`else
+        if (USE_BRAM != 0) begin : gen_bram_ram
+            (* ram_style = "block" *) reg [DATA_BITS-1:0] mem [0:DEPTH-1];
+
+            always @(posedge clk) begin
+                rd_data <= mem[rd_addr];
+                if (we) begin
+                    mem[wr_addr] <= wr_data;
+                end
+            end
+        end else begin : gen_generic_ram
+            reg [DATA_BITS-1:0] mem [0:DEPTH-1];
+
+            always @(posedge clk) begin
+                rd_data <= mem[rd_addr];
+                if (we) begin
+                    mem[wr_addr] <= wr_data;
+                end
+            end
+        end
+`endif
+    endgenerate
+
+endmodule
+
+/* verilator lint_on DECLFILENAME */

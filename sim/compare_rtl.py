@@ -24,7 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--max-frames", type=int, default=2)
-    parser.add_argument("--output-bits", type=int, default=14)
+    parser.add_argument("--input-bits", type=int, default=14)
+    parser.add_argument("--output-bits", type=int, default=10)
+    parser.add_argument("--histogram-bits", type=int, default=10)
     parser.add_argument("--input-stall-period", type=int, default=0)
     parser.add_argument("--output-stall-period", type=int, default=0)
     return parser.parse_args()
@@ -36,7 +38,12 @@ def main() -> int:
         raise FileNotFoundError(f"RTL simulator not found: {args.rtl_bin}. Run `make -C sim rtl-sim` first.")
 
     frames = model.load_frames(args.input, width=args.width, height=args.height, max_frames=args.max_frames)
-    expected, stats = model.process_frames_previous_lut(frames, input_bits=14, output_bits=args.output_bits)
+    expected, stats = model.process_frames_previous_lut(
+        frames,
+        input_bits=args.input_bits,
+        output_bits=args.output_bits,
+        histogram_bits=args.histogram_bits,
+    )
 
     with tempfile.TemporaryDirectory(prefix="hist-nonlinear-compare-") as tmpdir_name:
         tmpdir = Path(tmpdir_name)

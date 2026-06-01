@@ -44,8 +44,19 @@ def display_u8(frame: np.ndarray, *, output_bits: int) -> np.ndarray:
     return np.rint(clipped * (255.0 / max_value)).astype(np.uint8)
 
 
-def run_python_backend(frames: np.ndarray, *, output_bits: int) -> np.ndarray:
-    output, stats = model.process_frames_previous_lut(frames, input_bits=14, output_bits=output_bits)
+def run_python_backend(
+    frames: np.ndarray,
+    *,
+    input_bits: int,
+    output_bits: int,
+    histogram_bits: int | None,
+) -> np.ndarray:
+    output, stats = model.process_frames_previous_lut(
+        frames,
+        input_bits=input_bits,
+        output_bits=output_bits,
+        histogram_bits=histogram_bits,
+    )
     if stats:
         print(
             f"python backend: frame 0 bypassed, frame 1+ use previous-frame LUT, "
@@ -133,7 +144,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--recording", help="recording name under data/corrected-videos, default rec0")
     parser.add_argument("--max-frames", type=int, default=120)
     parser.add_argument("--fps", type=float, default=22.0)
-    parser.add_argument("--output-bits", type=int, default=14)
+    parser.add_argument("--input-bits", type=int, default=14)
+    parser.add_argument("--output-bits", type=int, default=10)
+    parser.add_argument("--histogram-bits", type=int, default=10)
     parser.add_argument("--backend", choices=("python", "rtl"), default="python")
     parser.add_argument("--rtl-bin", type=Path, default=DEFAULT_RTL_BIN)
     parser.add_argument("--width", type=int, default=640)
@@ -146,7 +159,12 @@ def main() -> int:
     input_path = find_video(args.recording, args.video)
     frames = model.load_frames(input_path, width=args.width, height=args.height, max_frames=args.max_frames)
     if args.backend == "python":
-        output = run_python_backend(frames, output_bits=args.output_bits)
+        output = run_python_backend(
+            frames,
+            input_bits=args.input_bits,
+            output_bits=args.output_bits,
+            histogram_bits=args.histogram_bits,
+        )
     else:
         output = run_rtl_backend(frames, rtl_bin=args.rtl_bin, width=frames.shape[2], height=frames.shape[1])
     play_side_by_side(frames, output, fps=args.fps, output_bits=args.output_bits)
