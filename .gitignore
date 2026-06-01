@@ -4,3 +4,4 @@ data
 **/*.pyc
 
 **/obj_dir
+tmp
