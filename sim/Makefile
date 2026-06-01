@@ -1,7 +1,10 @@
 VERILATOR ?= verilator
 TOP ?= hist_nonlinear_axi
 RTL ?= ../src/hist_nonlinear_axi.v
-OUTPUT_BITS ?= 14
+OUTPUT_BITS ?= 10
+INPUT_BITS ?= 10
+ADDR_BITS ?= 10
+INTENSITY_LEVELS ?= 1024
 FRAME_WIDTH ?= 640
 FRAME_HEIGHT ?= 512
 
@@ -14,7 +17,10 @@ all: rtl-sim
 
 rtl-sim:
 	$(VERILATOR) -Wall --cc $(RTL) --top-module $(TOP) \
+		-GINPUT_BITS=$(INPUT_BITS) \
 		-GOUTPUT_BITS=$(OUTPUT_BITS) \
+		-GADDR_BITS=$(ADDR_BITS) \
+		-GINTENSITY_LEVELS=$(INTENSITY_LEVELS) \
 		-GFRAME_WIDTH=$(FRAME_WIDTH) \
 		-GFRAME_HEIGHT=$(FRAME_HEIGHT) \
 		--exe rtl_sim_main.cpp \

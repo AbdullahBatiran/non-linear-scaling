@@ -1,15 +1,15 @@
 `timescale 1ns / 1ps
 
 module hist_nonlinear_axi #(
-    parameter INPUT_BITS = 14,
-    parameter OUTPUT_BITS = 14,
+    parameter INPUT_BITS = 10,
+    parameter OUTPUT_BITS = 10,
     parameter AXIS_BITS = 16,
     parameter FRAME_WIDTH = 640,
     parameter FRAME_HEIGHT = 512,
-    parameter INTENSITY_LEVELS = 16384,
+    parameter INTENSITY_LEVELS = 1024,
     parameter LOG_TABLE_ENTRIES = 1024,
     parameter COUNT_BITS = 32,
-    parameter ADDR_BITS = 14
+    parameter ADDR_BITS = 10
 ) (
     input wire aclk,
     input wire aresetn,
