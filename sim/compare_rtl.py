@@ -29,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--histogram-bits", type=int, default=10)
     parser.add_argument("--input-stall-period", type=int, default=0)
     parser.add_argument("--output-stall-period", type=int, default=0)
+    parser.add_argument("--trace", type=Path, help="write a Verilator VCD waveform; requires make -C sim rtl-sim TRACE=1")
     return parser.parse_args()
 
 
@@ -68,7 +69,9 @@ def main() -> int:
             command.extend(["--input-stall-period", str(args.input_stall_period)])
         if args.output_stall_period:
             command.extend(["--output-stall-period", str(args.output_stall_period)])
-        subprocess.run(command, check=True)
+        if args.trace is not None:
+            command.extend(["--trace", str(args.trace)])
+        subprocess.run(command, check=True, env=model.ffmpeg_environment())
 
         rtl = np.fromfile(rtl_path, dtype=np.uint16).reshape(expected.shape)
 

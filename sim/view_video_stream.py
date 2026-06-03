@@ -71,6 +71,7 @@ def run_rtl_backend(
     rtl_bin: Path,
     width: int,
     height: int,
+    trace: Path | None,
 ) -> np.ndarray:
     if not rtl_bin.is_file():
         raise FileNotFoundError(f"RTL simulator not found: {rtl_bin}. Run `make -C sim rtl-sim` first.")
@@ -80,21 +81,20 @@ def run_rtl_backend(
         input_path = tmpdir / "input.raw"
         output_path = tmpdir / "output.raw"
         frames.astype(np.uint16).tofile(input_path)
-        subprocess.run(
-            [
-                str(rtl_bin),
-                "--input",
-                str(input_path),
-                "--output",
-                str(output_path),
-                "--width",
-                str(width),
-                "--height",
-                str(height),
-            ],
-            check=True,
-            env=model.ffmpeg_environment(),
-        )
+        command = [
+            str(rtl_bin),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--width",
+            str(width),
+            "--height",
+            str(height),
+        ]
+        if trace is not None:
+            command.extend(["--trace", str(trace)])
+        subprocess.run(command, check=True, env=model.ffmpeg_environment())
         return model.load_raw16_video(output_path, width=width, height=height, max_frames=frames.shape[0])
 
 
@@ -150,6 +150,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--histogram-bits", type=int, default=10)
     parser.add_argument("--backend", choices=("python", "rtl"), default="python")
     parser.add_argument("--rtl-bin", type=Path, default=DEFAULT_RTL_BIN)
+    parser.add_argument("--trace", type=Path, help="write a Verilator VCD waveform for --backend rtl")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=512)
     return parser.parse_args()
@@ -157,6 +158,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.trace is not None and args.backend != "rtl":
+        raise ValueError("--trace only applies when --backend rtl is selected")
     input_path = find_video(args.recording, args.video)
     frames = model.load_frames(input_path, width=args.width, height=args.height, max_frames=args.max_frames)
     if args.backend == "python":
@@ -167,7 +170,13 @@ def main() -> int:
             histogram_bits=args.histogram_bits,
         )
     else:
-        output = run_rtl_backend(frames, rtl_bin=args.rtl_bin, width=frames.shape[2], height=frames.shape[1])
+        output = run_rtl_backend(
+            frames,
+            rtl_bin=args.rtl_bin,
+            width=frames.shape[2],
+            height=frames.shape[1],
+            trace=args.trace,
+        )
     play_side_by_side(frames, output, fps=args.fps, output_bits=args.output_bits)
     return 0
 
