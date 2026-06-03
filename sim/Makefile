@@ -1,7 +1,7 @@
 VERILATOR ?= verilator
 TOP ?= hist_nonlinear_axi
 RTL ?= ../src/hist_nonlinear_axi.v
-OUTPUT_BITS ?= 10
+OUTPUT_BITS ?= 8
 INPUT_BITS ?= 14
 ADDR_BITS ?= 10
 INTENSITY_LEVELS ?= 1024
