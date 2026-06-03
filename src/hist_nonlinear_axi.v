@@ -163,14 +163,18 @@ module hist_nonlinear_axi_core #(
     localparam STATE_LUT = 2'd3;
 
     localparam FRAME_PIXELS = FRAME_WIDTH * FRAME_HEIGHT;
+    localparam SCALE_BITS = COUNT_BITS + OUTPUT_BITS;
+    /* verilator lint_off WIDTHTRUNC */
+    localparam [7:0] SCALE_BITS_8 = SCALE_BITS;
+    /* verilator lint_on WIDTHTRUNC */
     localparam [ADDR_BITS-1:0] LAST_LEVEL_ADDR = {ADDR_BITS{1'b1}};
     localparam [COUNT_BITS-1:0] LAST_FRAME_PIXEL = FRAME_PIXELS - 1;
     localparam [COUNT_BITS-1:0] LOG_UPPER_LAST = (LOG_TABLE_ENTRIES / 2) - 1;
-    localparam [63:0] OUTPUT_MAX_64 = (64'd1 << OUTPUT_BITS) - 1;
+    localparam [SCALE_BITS-1:0] OUTPUT_MAX_SCALE = {{COUNT_BITS{1'b0}}, {OUTPUT_BITS{1'b1}}};
 
     reg [1:0] state;
     reg [1:0] stream_stage;
-    reg [1:0] build_stage;
+    reg [2:0] build_stage;
     reg [ADDR_BITS-1:0] clear_addr;
     reg [ADDR_BITS-1:0] build_addr;
     reg [COUNT_BITS-1:0] pixel_count;
@@ -179,6 +183,19 @@ module hist_nonlinear_axi_core #(
     reg [COUNT_BITS-1:0] cumulative;
     reg [COUNT_BITS-1:0] modified_value;
     reg [COUNT_BITS-1:0] next_cumulative;
+    reg [SCALE_BITS-1:0] scaled_value;
+
+    reg [ADDR_BITS-1:0] pending_lut_addr;
+    reg pending_lut_last_addr;
+    /* verilator lint_off UNUSEDSIGNAL */
+    reg [SCALE_BITS-1:0] div_numerator;
+    reg [SCALE_BITS-1:0] div_quotient;
+    reg [SCALE_BITS-1:0] div_quotient_next;
+    reg [COUNT_BITS:0] div_remainder;
+    /* verilator lint_on UNUSEDSIGNAL */
+    reg [COUNT_BITS:0] div_denominator;
+    reg [COUNT_BITS:0] div_trial;
+    reg [7:0] div_bit_count;
 
     reg [ADDR_BITS-1:0] stream_level;
     reg [OUTPUT_BITS-1:0] stream_bypass_pixel;
@@ -270,33 +287,25 @@ module hist_nonlinear_axi_core #(
         end
     endfunction
 
-    function [OUTPUT_BITS-1:0] scale_cumulative_to_lut;
-        input [COUNT_BITS-1:0] cumulative_value;
-        input [COUNT_BITS-1:0] total_value;
-        reg [63:0] scaled_value;
-        /* verilator lint_off UNUSEDSIGNAL */
-        reg [63:0] divided_value;
-        /* verilator lint_on UNUSEDSIGNAL */
-        begin
-            scaled_value = (({{(64-COUNT_BITS){1'b0}}, cumulative_value}) * OUTPUT_MAX_64)
-                + (({{(64-COUNT_BITS){1'b0}}, total_value}) >> 1);
-            divided_value = scaled_value / {{(64-COUNT_BITS){1'b0}}, total_value};
-            scale_cumulative_to_lut = divided_value[OUTPUT_BITS-1:0];
-        end
-    endfunction
-
     /* verilator lint_off BLKSEQ */
     always @(posedge aclk) begin
         if (!aresetn) begin
             state <= STATE_CLEAR;
             stream_stage <= 2'd0;
-            build_stage <= 2'd0;
+            build_stage <= 3'd0;
             clear_addr <= {ADDR_BITS{1'b0}};
             build_addr <= {ADDR_BITS{1'b0}};
             pixel_count <= {COUNT_BITS{1'b0}};
             modified_total <= {COUNT_BITS{1'b0}};
             lut_total <= {COUNT_BITS{1'b0}};
             cumulative <= {COUNT_BITS{1'b0}};
+            pending_lut_addr <= {ADDR_BITS{1'b0}};
+            pending_lut_last_addr <= 1'b0;
+            div_numerator <= {SCALE_BITS{1'b0}};
+            div_quotient <= {SCALE_BITS{1'b0}};
+            div_remainder <= {(COUNT_BITS+1){1'b0}};
+            div_denominator <= {(COUNT_BITS+1){1'b0}};
+            div_bit_count <= 8'd0;
             hist_we <= 1'b0;
             hist_waddr <= {ADDR_BITS{1'b0}};
             hist_wdata <= {COUNT_BITS{1'b0}};
@@ -381,7 +390,7 @@ module hist_nonlinear_axi_core #(
                                 if (stream_last_pixel) begin
                                     build_addr <= {ADDR_BITS{1'b0}};
                                     modified_total <= {COUNT_BITS{1'b0}};
-                                    build_stage <= 2'd0;
+                                    build_stage <= 3'd0;
                                     busy_building_lut <= 1'b1;
                                     state <= STATE_SUM;
                                 end
@@ -393,29 +402,33 @@ module hist_nonlinear_axi_core #(
                 STATE_SUM: begin
                     busy_building_lut <= 1'b1;
                     case (build_stage)
-                        2'd0: begin
+                        3'd0: begin
                             hist_raddr <= build_addr;
-                            build_stage <= 2'd1;
+                            build_stage <= 3'd1;
                         end
 
-                        2'd1: begin
-                            build_stage <= 2'd2;
+                        3'd1: begin
+                            build_stage <= 3'd2;
                         end
 
-                        default: begin
+                        3'd2: begin
                             modified_value = paper_log_count(hist_rdata);
                             if (build_addr == LAST_LEVEL_ADDR) begin
                                 lut_total <= modified_total + modified_value;
                                 modified_total <= {COUNT_BITS{1'b0}};
                                 build_addr <= {ADDR_BITS{1'b0}};
                                 cumulative <= {COUNT_BITS{1'b0}};
-                                build_stage <= 2'd0;
+                                build_stage <= 3'd0;
                                 state <= STATE_LUT;
                             end else begin
                                 modified_total <= modified_total + modified_value;
                                 build_addr <= build_addr + 1'b1;
-                                build_stage <= 2'd0;
+                                build_stage <= 3'd0;
                             end
+                        end
+
+                        default: begin
+                            build_stage <= 3'd0;
                         end
                     endcase
                 end
@@ -423,38 +436,85 @@ module hist_nonlinear_axi_core #(
                 STATE_LUT: begin
                     busy_building_lut <= 1'b1;
                     case (build_stage)
-                        2'd0: begin
+                        3'd0: begin
                             hist_raddr <= build_addr;
-                            build_stage <= 2'd1;
+                            build_stage <= 3'd1;
                         end
 
-                        2'd1: begin
-                            build_stage <= 2'd2;
+                        3'd1: begin
+                            build_stage <= 3'd2;
                         end
 
-                        default: begin
+                        3'd2: begin
                             modified_value = paper_log_count(hist_rdata);
                             next_cumulative = cumulative + modified_value;
                             cumulative <= next_cumulative;
-                            lut_we <= 1'b1;
-                            lut_waddr <= build_addr;
-                            if (lut_total == 0) begin
-                                lut_wdata <= {OUTPUT_BITS{1'b0}};
-                            end else begin
-                                lut_wdata <= scale_cumulative_to_lut(next_cumulative, lut_total);
-                            end
+                            pending_lut_addr <= build_addr;
+                            pending_lut_last_addr <= (build_addr == LAST_LEVEL_ADDR);
+                            build_stage <= 3'd3;
+                        end
 
-                            if (build_addr == LAST_LEVEL_ADDR) begin
-                                build_addr <= {ADDR_BITS{1'b0}};
-                                clear_addr <= {ADDR_BITS{1'b0}};
-                                cumulative <= {COUNT_BITS{1'b0}};
-                                build_stage <= 2'd0;
-                                lut_valid <= 1'b1;
-                                state <= STATE_CLEAR;
+                        3'd3: begin
+                            if (lut_total == 0) begin
+                                lut_we <= 1'b1;
+                                lut_waddr <= pending_lut_addr;
+                                lut_wdata <= {OUTPUT_BITS{1'b0}};
+                                if (pending_lut_last_addr) begin
+                                    build_addr <= {ADDR_BITS{1'b0}};
+                                    clear_addr <= {ADDR_BITS{1'b0}};
+                                    cumulative <= {COUNT_BITS{1'b0}};
+                                    build_stage <= 3'd0;
+                                    lut_valid <= 1'b1;
+                                    state <= STATE_CLEAR;
+                                end else begin
+                                    build_addr <= pending_lut_addr + 1'b1;
+                                    build_stage <= 3'd0;
+                                end
                             end else begin
-                                build_addr <= build_addr + 1'b1;
-                                build_stage <= 2'd0;
+                                scaled_value = (({{OUTPUT_BITS{1'b0}}, cumulative}) * OUTPUT_MAX_SCALE)
+                                    + {{OUTPUT_BITS{1'b0}}, (lut_total >> 1)};
+                                div_numerator <= scaled_value;
+                                div_quotient <= {SCALE_BITS{1'b0}};
+                                div_remainder <= {(COUNT_BITS+1){1'b0}};
+                                div_denominator <= {1'b0, lut_total};
+                                div_bit_count <= SCALE_BITS_8;
+                                build_stage <= 3'd4;
                             end
+                        end
+
+                        3'd4: begin
+                            div_trial = {div_remainder[COUNT_BITS-1:0], div_numerator[SCALE_BITS-1]};
+                            if (div_trial >= div_denominator) begin
+                                div_remainder <= div_trial - div_denominator;
+                                div_quotient_next = {div_quotient[SCALE_BITS-2:0], 1'b1};
+                            end else begin
+                                div_remainder <= div_trial;
+                                div_quotient_next = {div_quotient[SCALE_BITS-2:0], 1'b0};
+                            end
+                            div_numerator <= {div_numerator[SCALE_BITS-2:0], 1'b0};
+                            div_quotient <= div_quotient_next;
+                            div_bit_count <= div_bit_count - 1'b1;
+
+                            if (div_bit_count == 8'd1) begin
+                                lut_we <= 1'b1;
+                                lut_waddr <= pending_lut_addr;
+                                lut_wdata <= div_quotient_next[OUTPUT_BITS-1:0];
+                                if (pending_lut_last_addr) begin
+                                    build_addr <= {ADDR_BITS{1'b0}};
+                                    clear_addr <= {ADDR_BITS{1'b0}};
+                                    cumulative <= {COUNT_BITS{1'b0}};
+                                    build_stage <= 3'd0;
+                                    lut_valid <= 1'b1;
+                                    state <= STATE_CLEAR;
+                                end else begin
+                                    build_addr <= pending_lut_addr + 1'b1;
+                                    build_stage <= 3'd0;
+                                end
+                            end
+                        end
+
+                        default: begin
+                            build_stage <= 3'd0;
                         end
                     endcase
                 end
