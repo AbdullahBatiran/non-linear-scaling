@@ -189,9 +189,9 @@ if {$param_text ne ""} {
 puts "INFO: Synthesizing top=$top part=$part"
 if {[llength $generic_args] > 0} {
     puts "INFO: Parameter overrides: $generic_args"
-    synth_design -top $top -part $part -generic $generic_args
+    synth_design -top $top -part $part -mode out_of_context -generic $generic_args
 } else {
-    synth_design -top $top -part $part
+    synth_design -top $top -part $part -mode out_of_context
 }
 
 set input_ports {}
