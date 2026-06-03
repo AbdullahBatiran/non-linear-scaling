@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -251,6 +252,20 @@ def load_raw16_video(path: Path, *, width: int, height: int, max_frames: Optiona
     return frames
 
 
+def ffmpeg_environment() -> dict:
+    """Keep Vivado's bundled libraries from shadowing system ffmpeg libraries."""
+
+    env = os.environ.copy()
+    library_path = env.get("LD_LIBRARY_PATH")
+    if library_path:
+        paths = [path for path in library_path.split(os.pathsep) if "Xilinx" not in path]
+        if paths:
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(paths)
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
 def decode_mkv_gray16(path: Path, *, max_frames: Optional[int] = None) -> np.ndarray:
     probe = subprocess.run(
         [
@@ -268,6 +283,7 @@ def decode_mkv_gray16(path: Path, *, max_frames: Optional[int] = None) -> np.nda
         check=True,
         capture_output=True,
         text=True,
+        env=ffmpeg_environment(),
     )
     stream = json.loads(probe.stdout)["streams"][0]
     width = int(stream["width"])
@@ -284,7 +300,7 @@ def decode_mkv_gray16(path: Path, *, max_frames: Optional[int] = None) -> np.nda
         "gray16le",
         "-",
     ]
-    decoded = subprocess.run(command, check=True, capture_output=True).stdout
+    decoded = subprocess.run(command, check=True, capture_output=True, env=ffmpeg_environment()).stdout
     raw = np.frombuffer(decoded, dtype=np.uint16)
     frames = raw.reshape((-1, height, width))
     if max_frames is not None:
