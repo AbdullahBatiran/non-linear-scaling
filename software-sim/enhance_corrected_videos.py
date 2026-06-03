@@ -120,7 +120,7 @@ def preview_images_for_frame(
 
     images: list[tuple[str, np.ndarray, Optional[int], Optional[int]]] = []
     if compare_original:
-        images.append(("Corrected", frame, None, None))
+        images.append(("Original (Corrected)", frame, None, None))
     if compare_linear is not None:
         lower_percentile, upper_percentile = compare_linear
         linear = enhance_frame_linear(
@@ -246,6 +246,126 @@ def start_video_encoder(output_path: Path, *, width: int, height: int, fps: floa
     return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, env=ffmpeg_environment())
 
 
+def start_rgb_video_encoder(output_path: Path, *, width: int, height: int, fps: float):
+    import shutil
+    import subprocess
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is required to export comparison video, but it was not found on PATH")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s:v",
+        f"{width}x{height}",
+        "-r",
+        f"{fps:.6f}",
+        "-i",
+        "-",
+        "-an",
+    ]
+    if output_path.suffix.lower() in {".mp4", ".m4v", ".mov"}:
+        command.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+            ]
+        )
+    else:
+        command.extend(["-c:v", "ffv1", "-level", "3", "-g", "1", "-slicecrc", "1"])
+    command.append(str(output_path))
+    return subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE, env=ffmpeg_environment())
+
+
+def export_progress_total(frame_count: Optional[int], max_frames: Optional[int]) -> int | str:
+    if frame_count is not None and max_frames is not None:
+        return min(frame_count, max_frames)
+    if frame_count is not None:
+        return frame_count
+    if max_frames is not None:
+        return max_frames
+    return "?"
+
+
+def display_uint8(
+    image: np.ndarray,
+    *,
+    vmin: Optional[int],
+    vmax: Optional[int],
+    input_max: int,
+) -> np.ndarray:
+    """Convert one preview image to the 8-bit range used by comparison exports."""
+
+    low = 0.0 if vmin is None else float(vmin)
+    high = float(input_max) if vmax is None else float(vmax)
+    if high <= low:
+        return np.zeros(image.shape, dtype=np.uint8)
+
+    scaled = (image.astype(np.float64, copy=False) - low) * (255.0 / (high - low))
+    return np.rint(np.clip(scaled, 0, 255)).astype(np.uint8)
+
+
+def draw_panel_title(canvas: np.ndarray, title: str, *, x_offset: int, width: int, title_height: int) -> None:
+    import cv2
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = min(0.75, max(0.42, width / 900.0))
+    thickness = 1
+    text_size, baseline = cv2.getTextSize(title, font, font_scale, thickness)
+    while text_size[0] > width - 16 and font_scale > 0.3:
+        font_scale -= 0.05
+        text_size, baseline = cv2.getTextSize(title, font, font_scale, thickness)
+
+    text_x = x_offset + max(8, (width - text_size[0]) // 2)
+    text_y = max(text_size[1] + 4, (title_height + text_size[1]) // 2 - baseline)
+    cv2.putText(canvas, title, (text_x, text_y), font, font_scale, (238, 238, 238), thickness, cv2.LINE_AA)
+
+
+def comparison_frame(
+    images: list[tuple[str, np.ndarray, Optional[int], Optional[int]]],
+    *,
+    frame_width: int,
+    frame_height: int,
+    input_max: int,
+    title_height: int = 40,
+) -> np.ndarray:
+    """Render preview images into a titled side-by-side RGB frame."""
+
+    panel_count = len(images)
+    output_width = frame_width * panel_count
+    output_height = frame_height + title_height
+    encoded_width = output_width + (output_width % 2)
+    encoded_height = output_height + (output_height % 2)
+    canvas = np.full((encoded_height, encoded_width, 3), 18, dtype=np.uint8)
+
+    for index, (title, image, vmin, vmax) in enumerate(images):
+        x_offset = frame_width * index
+        panel = display_uint8(image, vmin=vmin, vmax=vmax, input_max=input_max)
+        rgb_panel = np.repeat(panel[:, :, np.newaxis], 3, axis=2)
+        canvas[title_height : title_height + frame_height, x_offset : x_offset + frame_width] = rgb_panel
+        draw_panel_title(canvas, title, x_offset=x_offset, width=frame_width, title_height=title_height)
+        if index:
+            canvas[:, x_offset : x_offset + 1] = 70
+
+    return canvas
+
+
 def export_enhanced_video(
     video_path: Path,
     *,
@@ -253,6 +373,7 @@ def export_enhanced_video(
     output_bits: int,
     fps_override: Optional[float],
     input_max: int,
+    max_frames: Optional[int],
 ) -> None:
     """Decode a corrected MKV, enhance every frame, and write a new MKV."""
 
@@ -268,6 +389,8 @@ def export_enhanced_video(
     frame_index = 0
     try:
         while True:
+            if max_frames is not None and frame_index >= max_frames:
+                break
             frame = read_video_frame(decoder, height=height, width=width)
             if frame is None:
                 break
@@ -275,8 +398,75 @@ def export_enhanced_video(
             encoder.stdin.write(enhanced.tobytes(order="C"))
             frame_index += 1
             if frame_index % 50 == 0 or frame_index == frame_count:
-                total = frame_count if frame_count is not None else "?"
-                print(f"  wrote {frame_index}/{total} frames")
+                print(f"  wrote {frame_index}/{export_progress_total(frame_count, max_frames)} frames")
+    finally:
+        if decoder.poll() is None:
+            decoder.terminate()
+        if not encoder.stdin.closed:
+            encoder.stdin.close()
+
+    stderr = encoder.stderr.read() if encoder.stderr is not None else b""
+    return_code = encoder.wait()
+    if return_code != 0:
+        raise RuntimeError(stderr.decode("utf-8", errors="replace"))
+    print(f"Done: {frame_index} frames")
+
+
+def export_comparison_video(
+    video_path: Path,
+    *,
+    output_path: Path,
+    output_bits: int,
+    fps_override: Optional[float],
+    input_max: int,
+    max_frames: Optional[int],
+    compare_original: bool,
+    compare_linear: Optional[tuple[float, float]],
+) -> None:
+    """Decode a corrected MKV and write a side-by-side comparison video."""
+
+    width, height, probed_fps, frame_count = probe_video(video_path)
+    fps = fps_override or probed_fps or 22.0
+    decoder = start_video_decoder(video_path)
+
+    output_width = width * (1 + int(compare_original) + int(compare_linear is not None))
+    output_height = height + 40
+    encoder = start_rgb_video_encoder(
+        output_path,
+        width=output_width + (output_width % 2),
+        height=output_height + (output_height % 2),
+        fps=fps,
+    )
+    assert encoder.stdin is not None
+
+    print(f"Comparing {video_path}")
+    print(f"Writing side-by-side comparison video to {output_path}")
+
+    frame_index = 0
+    try:
+        while True:
+            if max_frames is not None and frame_index >= max_frames:
+                break
+            frame = read_video_frame(decoder, height=height, width=width)
+            if frame is None:
+                break
+            images = preview_images_for_frame(
+                frame,
+                output_bits=output_bits,
+                input_max=input_max,
+                compare_original=compare_original,
+                compare_linear=compare_linear,
+            )
+            rendered_frame = comparison_frame(
+                images,
+                frame_width=width,
+                frame_height=height,
+                input_max=input_max,
+            )
+            encoder.stdin.write(rendered_frame.tobytes(order="C"))
+            frame_index += 1
+            if frame_index % 50 == 0 or frame_index == frame_count:
+                print(f"  wrote {frame_index}/{export_progress_total(frame_count, max_frames)} frames")
     finally:
         if decoder.poll() is None:
             decoder.terminate()
@@ -413,6 +603,10 @@ def default_output_path(video_path: Path, output_dir: Path, output_bits: int) ->
     return output_dir / f"{video_path.stem}_nonlinear_{output_bits}bit.mkv"
 
 
+def default_comparison_output_path(video_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{video_path.stem}_comparison.mp4"
+
+
 def parse_linear_percentiles(value: str) -> tuple[float, float]:
     parts = value.split(",")
     if len(parts) != 2:
@@ -457,6 +651,16 @@ def parse_histogram_options(value: str) -> tuple[int, str]:
     return bins, yscale
 
 
+def parse_positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
 def normalize_comma_option_args(argv: list[str]) -> list[str]:
     normalized = []
     for arg in argv:
@@ -478,12 +682,22 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--recording",
         help="MKV file name, stem such as rec0, or path. Defaults to the first MKV in data/corrected-videos.",
     )
-    parser.add_argument("--output", type=Path, help="output MKV path for export mode")
+    parser.add_argument("--output", type=Path, help="output path for export mode")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-bits", type=int, choices=(8, 16), default=8)
     parser.add_argument("--input-max", type=int, default=2**14-1, help="input range maximum for the scaler")
     parser.add_argument("--fps", type=float, help="override detected FPS")
+    parser.add_argument(
+        "--max-frames",
+        type=parse_positive_int,
+        help="limit the number of frames written in export mode",
+    )
     parser.add_argument("--export", action="store_true", help="write enhanced MKV instead of previewing")
+    parser.add_argument(
+        "--export-comparison",
+        action="store_true",
+        help="write a shareable side-by-side video with corrected original, linear stretch, and non-linear enhanced panels",
+    )
     parser.add_argument("--compare-original", action="store_true", help="show corrected and enhanced frames side by side")
     parser.add_argument(
         "--compare-linear",
@@ -503,12 +717,31 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=parse_histogram_options,
         help="show per-frame histograms in a second window; defaults to 256,linear",
     )
-    return parser.parse_args(normalize_comma_option_args(argv if argv is not None else sys.argv[1:]))
+    return parser.parse_args(
+        normalize_comma_option_args(argv if argv is not None else sys.argv[1:])
+    )
 
 
 def main() -> None:
     args = parse_args()
+    if args.export and args.export_comparison:
+        raise ValueError("--export and --export-comparison cannot be combined")
+
     video_path = find_video(args.video_dir, args.recording)
+
+    if args.export_comparison:
+        output_path = args.output or default_comparison_output_path(video_path, args.output_dir)
+        export_comparison_video(
+            video_path,
+            output_path=output_path,
+            output_bits=args.output_bits,
+            fps_override=args.fps,
+            input_max=args.input_max,
+            max_frames=args.max_frames,
+            compare_original=True,
+            compare_linear=args.compare_linear or DEFAULT_LINEAR_PERCENTILES,
+        )
+        return
 
     if args.export:
         output_path = args.output or default_output_path(video_path, args.output_dir, args.output_bits)
@@ -518,6 +751,7 @@ def main() -> None:
             output_bits=args.output_bits,
             fps_override=args.fps,
             input_max=args.input_max,
+            max_frames=args.max_frames,
         )
         return
 

@@ -75,3 +75,25 @@ Useful options:
 - `--export-video output.mkv`: write the MKV to a chosen path.
 
 Video export and MKV playback require `ffmpeg` and `ffprobe` on `PATH`.
+
+## Enhanced Video Comparison
+
+`enhance_corrected_videos.py` can preview or export enhanced corrected MKV recordings from
+`data/corrected-videos`.
+
+Preview original, linear stretch, and non-linear enhanced frames:
+
+```bash
+python enhance_corrected_videos.py --recording rec0 --compare-original --compare-linear
+```
+
+Export a shareable side-by-side MP4 with original, linear stretch, and non-linear enhanced panels:
+
+```bash
+python enhance_corrected_videos.py --recording rec0 --export-comparison
+```
+
+The default comparison export writes to `data/corrected-videos/enhanced/rec0_comparison.mp4`.
+Use `--output path/to/file.mp4` to choose a different file, `--compare-linear LOW,HIGH` to adjust
+the linear stretch percentiles, `--fps FPS` to override the detected frame rate, and
+`--max-frames N` to export a short sample.

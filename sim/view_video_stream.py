@@ -93,6 +93,7 @@ def run_rtl_backend(
                 str(height),
             ],
             check=True,
+            env=model.ffmpeg_environment(),
         )
         return model.load_raw16_video(output_path, width=width, height=height, max_frames=frames.shape[0])
 
