@@ -171,9 +171,9 @@ module hist_nonlinear_axi_core #(
     localparam [COUNT_BITS-1:0] LAST_FRAME_PIXEL = FRAME_PIXELS - 1;
     localparam [COUNT_BITS-1:0] LOG_UPPER_LAST = (LOG_TABLE_ENTRIES / 2) - 1;
     localparam [SCALE_BITS-1:0] OUTPUT_MAX_SCALE = {{COUNT_BITS{1'b0}}, {OUTPUT_BITS{1'b1}}};
+    localparam HIST_BYPASS_ENTRIES = 8;
 
     reg [1:0] state;
-    reg [1:0] stream_stage;
     reg [2:0] build_stage;
     reg [ADDR_BITS-1:0] clear_addr;
     reg [ADDR_BITS-1:0] build_addr;
@@ -197,25 +197,49 @@ module hist_nonlinear_axi_core #(
     reg [COUNT_BITS:0] div_trial;
     reg [7:0] div_bit_count;
 
-    reg [ADDR_BITS-1:0] stream_level;
-    reg [OUTPUT_BITS-1:0] stream_bypass_pixel;
-    reg stream_tuser;
-    reg stream_tlast;
-    reg stream_last_pixel;
+    reg stream_draining;
+    reg stream_pipe0_valid;
+    reg stream_pipe1_valid;
+    reg [ADDR_BITS-1:0] stream_pipe0_level;
+    reg [ADDR_BITS-1:0] stream_pipe1_level;
+    reg [OUTPUT_BITS-1:0] stream_pipe0_bypass_pixel;
+    reg [OUTPUT_BITS-1:0] stream_pipe1_bypass_pixel;
+    reg stream_pipe0_tuser;
+    reg stream_pipe1_tuser;
+    reg stream_pipe0_tlast;
+    reg stream_pipe1_tlast;
+    reg stream_pipe0_last_pixel;
+    reg stream_pipe1_last_pixel;
+    reg stream_pipe1_data_held;
+    reg [COUNT_BITS-1:0] stream_pipe1_hist_rdata;
+    reg [OUTPUT_BITS-1:0] stream_pipe1_lut_rdata;
+
+    reg [HIST_BYPASS_ENTRIES-1:0] hist_bypass_valid;
+    reg [ADDR_BITS-1:0] hist_bypass_addr [0:HIST_BYPASS_ENTRIES-1];
+    reg [COUNT_BITS-1:0] hist_bypass_data [0:HIST_BYPASS_ENTRIES-1];
+    reg [COUNT_BITS-1:0] hist_count_value;
+    reg hist_bypass_found;
+    integer hist_bypass_index;
 
     wire output_slot_available;
+    wire stream_advance;
     wire input_transfer;
     wire [ADDR_BITS-1:0] input_level;
+    wire [COUNT_BITS-1:0] stream_hist_rdata;
+    wire [OUTPUT_BITS-1:0] stream_lut_rdata;
     wire [OUTPUT_BITS-1:0] output_pixel;
     /* verilator lint_off UNUSEDSIGNAL */
     wire [AXIS_BITS-INPUT_BITS-1:0] unused_input_bits;
     /* verilator lint_on UNUSEDSIGNAL */
 
     assign output_slot_available = (!m_axis_tvalid) || m_axis_tready;
-    assign s_axis_tready = (state == STATE_STREAM) && (stream_stage == 2'd0) && output_slot_available;
+    assign stream_advance = output_slot_available && m_axis_tready;
+    assign s_axis_tready = (state == STATE_STREAM) && (!stream_draining) && stream_advance;
     assign input_transfer = s_axis_tvalid && s_axis_tready;
     assign input_level = s_axis_tdata[INPUT_BITS-1 -: ADDR_BITS];
-    assign output_pixel = lut_valid ? lut_rdata : stream_bypass_pixel;
+    assign stream_hist_rdata = stream_pipe1_data_held ? stream_pipe1_hist_rdata : hist_rdata;
+    assign stream_lut_rdata = stream_pipe1_data_held ? stream_pipe1_lut_rdata : lut_rdata;
+    assign output_pixel = lut_valid ? stream_lut_rdata : stream_pipe1_bypass_pixel;
     assign unused_input_bits = s_axis_tdata[AXIS_BITS-1:INPUT_BITS];
 
     generate
@@ -291,7 +315,6 @@ module hist_nonlinear_axi_core #(
     always @(posedge aclk) begin
         if (!aresetn) begin
             state <= STATE_CLEAR;
-            stream_stage <= 2'd0;
             build_stage <= 3'd0;
             clear_addr <= {ADDR_BITS{1'b0}};
             build_addr <= {ADDR_BITS{1'b0}};
@@ -310,15 +333,31 @@ module hist_nonlinear_axi_core #(
             hist_waddr <= {ADDR_BITS{1'b0}};
             hist_wdata <= {COUNT_BITS{1'b0}};
             hist_raddr <= {ADDR_BITS{1'b0}};
+            hist_bypass_valid <= {HIST_BYPASS_ENTRIES{1'b0}};
+            for (hist_bypass_index = 0; hist_bypass_index < HIST_BYPASS_ENTRIES; hist_bypass_index = hist_bypass_index + 1) begin
+                hist_bypass_addr[hist_bypass_index] <= {ADDR_BITS{1'b0}};
+                hist_bypass_data[hist_bypass_index] <= {COUNT_BITS{1'b0}};
+            end
             lut_we <= 1'b0;
             lut_waddr <= {ADDR_BITS{1'b0}};
             lut_wdata <= {OUTPUT_BITS{1'b0}};
             lut_raddr <= {ADDR_BITS{1'b0}};
-            stream_level <= {ADDR_BITS{1'b0}};
-            stream_bypass_pixel <= {OUTPUT_BITS{1'b0}};
-            stream_tuser <= 1'b0;
-            stream_tlast <= 1'b0;
-            stream_last_pixel <= 1'b0;
+            stream_draining <= 1'b0;
+            stream_pipe0_valid <= 1'b0;
+            stream_pipe1_valid <= 1'b0;
+            stream_pipe0_level <= {ADDR_BITS{1'b0}};
+            stream_pipe1_level <= {ADDR_BITS{1'b0}};
+            stream_pipe0_bypass_pixel <= {OUTPUT_BITS{1'b0}};
+            stream_pipe1_bypass_pixel <= {OUTPUT_BITS{1'b0}};
+            stream_pipe0_tuser <= 1'b0;
+            stream_pipe1_tuser <= 1'b0;
+            stream_pipe0_tlast <= 1'b0;
+            stream_pipe1_tlast <= 1'b0;
+            stream_pipe0_last_pixel <= 1'b0;
+            stream_pipe1_last_pixel <= 1'b0;
+            stream_pipe1_data_held <= 1'b0;
+            stream_pipe1_hist_rdata <= {COUNT_BITS{1'b0}};
+            stream_pipe1_lut_rdata <= {OUTPUT_BITS{1'b0}};
             m_axis_tdata <= {AXIS_BITS{1'b0}};
             m_axis_tvalid <= 1'b0;
             m_axis_tuser <= 1'b0;
@@ -326,6 +365,16 @@ module hist_nonlinear_axi_core #(
             busy_building_lut <= 1'b0;
             lut_valid <= 1'b0;
         end else begin
+            if (hist_we) begin
+                for (hist_bypass_index = HIST_BYPASS_ENTRIES - 1; hist_bypass_index > 0; hist_bypass_index = hist_bypass_index - 1) begin
+                    hist_bypass_valid[hist_bypass_index] <= hist_bypass_valid[hist_bypass_index - 1];
+                    hist_bypass_addr[hist_bypass_index] <= hist_bypass_addr[hist_bypass_index - 1];
+                    hist_bypass_data[hist_bypass_index] <= hist_bypass_data[hist_bypass_index - 1];
+                end
+                hist_bypass_valid[0] <= 1'b1;
+                hist_bypass_addr[0] <= hist_waddr;
+                hist_bypass_data[0] <= hist_wdata;
+            end
             hist_we <= 1'b0;
             lut_we <= 1'b0;
 
@@ -344,7 +393,10 @@ module hist_nonlinear_axi_core #(
                     if (clear_addr == LAST_LEVEL_ADDR) begin
                         clear_addr <= {ADDR_BITS{1'b0}};
                         pixel_count <= {COUNT_BITS{1'b0}};
-                        stream_stage <= 2'd0;
+                        stream_draining <= 1'b0;
+                        stream_pipe0_valid <= 1'b0;
+                        stream_pipe1_valid <= 1'b0;
+                        stream_pipe1_data_held <= 1'b0;
                         busy_building_lut <= 1'b0;
                         state <= STATE_STREAM;
                     end else begin
@@ -354,49 +406,70 @@ module hist_nonlinear_axi_core #(
 
                 STATE_STREAM: begin
                     busy_building_lut <= 1'b0;
-                    case (stream_stage)
-                        2'd0: begin
-                            if (input_transfer) begin
-                                hist_raddr <= input_level;
-                                lut_raddr <= input_level;
-                                stream_level <= input_level;
-                                stream_bypass_pixel <= s_axis_tdata[INPUT_BITS-1 -: OUTPUT_BITS];
-                                stream_tuser <= s_axis_tuser;
-                                stream_tlast <= s_axis_tlast;
-                                stream_last_pixel <= (pixel_count == LAST_FRAME_PIXEL);
-                                stream_stage <= 2'd1;
-                                if (pixel_count == LAST_FRAME_PIXEL) begin
-                                    pixel_count <= {COUNT_BITS{1'b0}};
-                                end else begin
-                                    pixel_count <= pixel_count + 1'b1;
+                    if (stream_advance) begin
+                        if (stream_pipe1_valid) begin
+                            hist_count_value = stream_hist_rdata;
+                            hist_bypass_found = 1'b0;
+                            for (hist_bypass_index = 0; hist_bypass_index < HIST_BYPASS_ENTRIES; hist_bypass_index = hist_bypass_index + 1) begin
+                                if ((!hist_bypass_found) && hist_bypass_valid[hist_bypass_index]
+                                    && (hist_bypass_addr[hist_bypass_index] == stream_pipe1_level)) begin
+                                    hist_count_value = hist_bypass_data[hist_bypass_index];
+                                    hist_bypass_found = 1'b1;
                                 end
+                            end
+                            if (hist_we && (hist_waddr == stream_pipe1_level)) begin
+                                hist_count_value = hist_wdata;
+                            end
+
+                            hist_we <= 1'b1;
+                            hist_waddr <= stream_pipe1_level;
+                            hist_wdata <= hist_count_value + 1'b1;
+                            m_axis_tdata <= {{(AXIS_BITS-OUTPUT_BITS){1'b0}}, output_pixel};
+                            m_axis_tvalid <= 1'b1;
+                            m_axis_tuser <= stream_pipe1_tuser;
+                            m_axis_tlast <= stream_pipe1_tlast;
+                        end
+
+                        stream_pipe1_valid <= stream_pipe0_valid;
+                        stream_pipe1_level <= stream_pipe0_level;
+                        stream_pipe1_bypass_pixel <= stream_pipe0_bypass_pixel;
+                        stream_pipe1_tuser <= stream_pipe0_tuser;
+                        stream_pipe1_tlast <= stream_pipe0_tlast;
+                        stream_pipe1_last_pixel <= stream_pipe0_last_pixel;
+                        stream_pipe1_data_held <= 1'b0;
+
+                        stream_pipe0_valid <= input_transfer;
+                        if (input_transfer) begin
+                            hist_raddr <= input_level;
+                            lut_raddr <= input_level;
+                            stream_pipe0_level <= input_level;
+                            stream_pipe0_bypass_pixel <= s_axis_tdata[INPUT_BITS-1 -: OUTPUT_BITS];
+                            stream_pipe0_tuser <= s_axis_tuser;
+                            stream_pipe0_tlast <= s_axis_tlast;
+                            stream_pipe0_last_pixel <= (pixel_count == LAST_FRAME_PIXEL);
+                            if (pixel_count == LAST_FRAME_PIXEL) begin
+                                pixel_count <= {COUNT_BITS{1'b0}};
+                                stream_draining <= 1'b1;
+                            end else begin
+                                pixel_count <= pixel_count + 1'b1;
                             end
                         end
 
-                        2'd1: begin
-                            stream_stage <= 2'd2;
+                        if (stream_pipe1_valid && stream_pipe1_last_pixel) begin
+                            stream_draining <= 1'b0;
+                            stream_pipe0_valid <= 1'b0;
+                            stream_pipe1_valid <= 1'b0;
+                            build_addr <= {ADDR_BITS{1'b0}};
+                            modified_total <= {COUNT_BITS{1'b0}};
+                            build_stage <= 3'd0;
+                            busy_building_lut <= 1'b1;
+                            state <= STATE_SUM;
                         end
-
-                        default: begin
-                            if (output_slot_available) begin
-                                hist_we <= 1'b1;
-                                hist_waddr <= stream_level;
-                                hist_wdata <= hist_rdata + 1'b1;
-                                m_axis_tdata <= {{(AXIS_BITS-OUTPUT_BITS){1'b0}}, output_pixel};
-                                m_axis_tvalid <= 1'b1;
-                                m_axis_tuser <= stream_tuser;
-                                m_axis_tlast <= stream_tlast;
-                                stream_stage <= 2'd0;
-                                if (stream_last_pixel) begin
-                                    build_addr <= {ADDR_BITS{1'b0}};
-                                    modified_total <= {COUNT_BITS{1'b0}};
-                                    build_stage <= 3'd0;
-                                    busy_building_lut <= 1'b1;
-                                    state <= STATE_SUM;
-                                end
-                            end
-                        end
-                    endcase
+                    end else if (stream_pipe1_valid && !stream_pipe1_data_held) begin
+                        stream_pipe1_data_held <= 1'b1;
+                        stream_pipe1_hist_rdata <= hist_rdata;
+                        stream_pipe1_lut_rdata <= lut_rdata;
+                    end
                 end
 
                 STATE_SUM: begin
